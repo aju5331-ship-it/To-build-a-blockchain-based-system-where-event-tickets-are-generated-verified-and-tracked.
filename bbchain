@@ -1,0 +1,394 @@
+"""
+Ticket Blockchain - single-file demo
+
+Purpose:
+A simple, self-contained Python demo implementing a blockchain-backed ticketing system.
+It allows:
+ - issuing tickets (stored as transactions on the chain)
+ - verifying tickets by ticket ID and owner
+ - tracking ticket status (issued, transferred, redeemed)
+ - viewing the blockchain and tickets
+
+This file is intended to be pasted into a GitHub repo as a single-file demo.
+
+Requirements (install with pip):
+    pip install flask ecdsa
+
+How it works (high level):
+ - A minimal blockchain (Proof-of-Work optional) where each block contains a list of ticket transactions.
+ - Tickets are issued as transactions signed by the "issuer" private key.
+ - The chain's integrity is enforced via hashes linking blocks together.
+ - A small Flask REST API exposes endpoints to issue, verify, transfer, redeem, and query tickets.
+ - Persistence: chain and tickets are saved to a local JSON file (chain_store.json) for simplicity.
+
+Notes & limitations:
+ - This is a learning/demo implementation; it is NOT production-ready.
+ - No distributed consensus is implemented (this is a single-node chain).
+ - The cryptographic signing uses ECDSA (secp256k1-like curve via ecdsa library).
+
+Usage examples:
+ 1) Start server:
+    python ticket_blockchain.py
+
+ 2) Generate keys (run the helper in this file or use the CLI below):
+    python ticket_blockchain.py genkeys
+
+ 3) Issue a ticket (curl):
+    curl -X POST http://127.0.0.1:5000/issue -H "Content-Type: application/json" -d '{"event":"Cool Concert","owner":"alice@example.com","price":500}'
+
+ 4) Verify ticket:
+    curl http://127.0.0.1:5000/verify/<ticket_id>
+
+File contents below implement the server, blockchain, storage, and helper CLI.
+"""
+
+import os
+import json
+import time
+import hashlib
+import uuid
+import argparse
+from typing import List, Dict, Any, Optional
+from flask import Flask, request, jsonify
+from ecdsa import SigningKey, VerifyingKey, NIST256p
+
+# --- Configuration ---
+DATA_FILE = "chain_store.json"
+MINING_DIFFICULTY = 3  # leading zeros required in block hash (light for demo)
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 5000
+
+app = Flask(__name__)
+
+# --- Utilities ---
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+# --- Ticket & Blockchain data models (simple dict-based) ---
+
+class TicketBlockchain:
+    def __init__(self, store_path: str = DATA_FILE):
+        self.store_path = store_path
+        self.chain: List[Dict[str, Any]] = []
+        self.pending_transactions: List[Dict[str, Any]] = []
+        self.load()
+        if not self.chain:
+            self.create_genesis_block()
+
+    # Persistence
+    def load(self):
+        if not os.path.exists(self.store_path):
+            self.chain = []
+            self.pending_transactions = []
+            return
+        with open(self.store_path, "r") as f:
+            data = json.load(f)
+            self.chain = data.get("chain", [])
+            self.pending_transactions = data.get("pending_transactions", [])
+
+    def save(self):
+        with open(self.store_path, "w") as f:
+            json.dump({"chain": self.chain, "pending_transactions": self.pending_transactions}, f, indent=2)
+
+    # Blockchain
+    def create_genesis_block(self):
+        genesis = {
+            "index": 0,
+            "timestamp": now_ts(),
+            "transactions": [],
+            "nonce": 0,
+            "previous_hash": "0" * 64,
+        }
+        genesis_hash = self.hash_block(genesis)
+        genesis["hash"] = genesis_hash
+        self.chain = [genesis]
+        self.save()
+
+    def last_block(self) -> Dict[str, Any]:
+        return self.chain[-1]
+
+    def hash_block(self, block: Dict[str, Any]) -> str:
+        # We must ensure stable serialization
+        block_copy = {k: block[k] for k in sorted(block) if k != "hash"}
+        block_string = json.dumps(block_copy, sort_keys=True)
+        return sha256_hex(block_string)
+
+    def proof_of_work(self, block_template: Dict[str, Any]) -> Dict[str, Any]:
+        nonce = 0
+        while True:
+            block_template["nonce"] = nonce
+            h = self.hash_block(block_template)
+            if h.startswith("0" * MINING_DIFFICULTY):
+                block_template["hash"] = h
+                return block_template
+            nonce += 1
+
+    def mine_pending(self, miner_address: Optional[str] = None) -> Dict[str, Any]:
+        if not self.pending_transactions:
+            return {}
+        new_block = {
+            "index": len(self.chain),
+            "timestamp": now_ts(),
+            "transactions": self.pending_transactions.copy(),
+            "nonce": 0,
+            "previous_hash": self.last_block().get("hash"),
+        }
+        new_block = self.proof_of_work(new_block)
+        self.chain.append(new_block)
+        # clear pending
+        self.pending_transactions = []
+        self.save()
+        return new_block
+
+    # Ticket operations implemented as transactions
+    def create_ticket_transaction(self, ticket: Dict[str, Any]) -> Dict[str, Any]:
+        # ticket must include: ticket_id, event, owner, timestamp, issuer_pubkey, signature, status
+        tx = {"type": "issue", "ticket": ticket}
+        self.pending_transactions.append(tx)
+        self.save()
+        return tx
+
+    def transfer_ticket_transaction(self, ticket_id: str, new_owner: str, operator_pubkey: str, signature: str) -> Dict[str, Any]:
+        tx = {"type": "transfer", "ticket_id": ticket_id, "new_owner": new_owner, "operator_pubkey": operator_pubkey, "signature": signature, "timestamp": now_ts()}
+        self.pending_transactions.append(tx)
+        self.save()
+        return tx
+
+    def redeem_ticket_transaction(self, ticket_id: str, operator_pubkey: str, signature: str) -> Dict[str, Any]:
+        tx = {"type": "redeem", "ticket_id": ticket_id, "operator_pubkey": operator_pubkey, "signature": signature, "timestamp": now_ts()}
+        self.pending_transactions.append(tx)
+        self.save()
+        return tx
+
+    # Querying
+    def find_ticket_history(self, ticket_id: str) -> List[Dict[str, Any]]:
+        history = []
+        for block in self.chain:
+            for tx in block.get("transactions", []):
+                if tx.get("type") == "issue" and tx["ticket"]["ticket_id"] == ticket_id:
+                    history.append(tx)
+                elif tx.get("type") in ("transfer", "redeem") and tx.get("ticket_id") == ticket_id:
+                    history.append(tx)
+        # also include pending transactions
+        for tx in self.pending_transactions:
+            if tx.get("type") == "issue" and tx["ticket"]["ticket_id"] == ticket_id:
+                history.append(tx)
+            elif tx.get("type") in ("transfer", "redeem") and tx.get("ticket_id") == ticket_id:
+                history.append(tx)
+        return history
+
+    def reconstruct_ticket_state(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        history = self.find_ticket_history(ticket_id)
+        if not history:
+            return None
+        state = None
+        for tx in history:
+            if tx.get("type") == "issue":
+                state = tx["ticket"].copy()
+            elif tx.get("type") == "transfer":
+                if state:
+                    state["owner"] = tx["new_owner"]
+                    state["status"] = "transferred"
+                    state.setdefault("transfers", []).append({"to": tx["new_owner"], "operator": tx["operator_pubkey"], "timestamp": tx["timestamp"]})
+            elif tx.get("type") == "redeem":
+                if state:
+                    state["status"] = "redeemed"
+                    state.setdefault("redeemed_at", tx["timestamp"])
+        return state
+
+# --- Cryptographic helpers ---
+
+def gen_keys() -> Dict[str, str]:
+    sk = SigningKey.generate(curve=NIST256p)
+    vk = sk.get_verifying_key()
+    return {"private_key_hex": sk.to_string().hex(), "public_key_hex": vk.to_string().hex()}
+
+
+def load_signing_key_from_hex(hexstr: str) -> SigningKey:
+    return SigningKey.from_string(bytes.fromhex(hexstr), curve=NIST256p)
+
+
+def load_verifying_key_from_hex(hexstr: str) -> VerifyingKey:
+    return VerifyingKey.from_string(bytes.fromhex(hexstr), curve=NIST256p)
+
+
+def sign_message_hex(private_hex: str, message: str) -> str:
+    sk = load_signing_key_from_hex(private_hex)
+    sig = sk.sign(message.encode("utf-8"))
+    return sig.hex()
+
+
+def verify_signature_hex(public_hex: str, message: str, signature_hex: str) -> bool:
+    try:
+        vk = load_verifying_key_from_hex(public_hex)
+        return vk.verify(bytes.fromhex(signature_hex), message.encode("utf-8"))
+    except Exception:
+        return False
+
+# --- Instantiate blockchain ---
+bc = TicketBlockchain()
+
+# --- Flask API endpoints ---
+
+@app.route("/chain", methods=["GET"])
+def get_chain():
+    return jsonify({"chain": bc.chain, "pending_transactions": bc.pending_transactions})
+
+@app.route("/mine", methods=["POST"])
+def mine():
+    miner_address = request.json.get("miner_address") if request.is_json else None
+    new_block = bc.mine_pending(miner_address)
+    if not new_block:
+        return jsonify({"error": "No pending transactions to mine"}), 400
+    return jsonify({"message": "Block mined", "block": new_block})
+
+@app.route("/issue", methods=["POST"])
+def issue_ticket():
+    if not request.is_json:
+        return jsonify({"error": "JSON payload required"}), 400
+    payload = request.get_json()
+    required = ["event", "owner", "issuer_pubkey", "issuer_signature"]
+    # issuer_signature is signature over (event + owner + timestamp + ticket_id)
+    for r in required:
+        if r not in payload:
+            return jsonify({"error": f"Missing field {r}"}), 400
+    ticket_id = payload.get("ticket_id") or str(uuid.uuid4())
+    timestamp = now_ts()
+    ticket = {
+        "ticket_id": ticket_id,
+        "event": payload["event"],
+        "owner": payload["owner"],
+        "price": payload.get("price"),
+        "issued_at": timestamp,
+        "issuer_pubkey": payload.get("issuer_pubkey"),
+        "status": "issued",
+    }
+    # verify issuer signature
+    message = f"ISSUE|{ticket['event']}|{ticket['owner']}|{ticket_id}|{timestamp}"
+    if not verify_signature_hex(payload["issuer_pubkey"], message, payload["issuer_signature"]):
+        return jsonify({"error": "Invalid issuer signature"}), 400
+    ticket["issuer_signature_validated_for"] = payload["issuer_pubkey"]
+    tx = bc.create_ticket_transaction(ticket)
+    return jsonify({"message": "Ticket queued for issuance (pending mining)", "ticket": ticket, "tx": tx})
+
+@app.route("/transfer", methods=["POST"])
+def transfer_ticket():
+    if not request.is_json:
+        return jsonify({"error": "JSON payload required"}), 400
+    payload = request.get_json()
+    required = ["ticket_id", "new_owner", "operator_pubkey", "operator_signature"]
+    for r in required:
+        if r not in payload:
+            return jsonify({"error": f"Missing field {r}"}), 400
+    message = f"TRANSFER|{payload['ticket_id']}|{payload['new_owner']}|{payload.get('timestamp', '')}"
+    if not verify_signature_hex(payload["operator_pubkey"], message, payload["operator_signature"]):
+        return jsonify({"error": "Invalid operator signature"}), 400
+    tx = bc.transfer_ticket_transaction(payload["ticket_id"], payload["new_owner"], payload["operator_pubkey"], payload["operator_signature"])
+    return jsonify({"message": "Transfer queued (pending mining)", "tx": tx})
+
+@app.route("/redeem", methods=["POST"])
+def redeem_ticket():
+    if not request.is_json:
+        return jsonify({"error": "JSON payload required"}), 400
+    payload = request.get_json()
+    required = ["ticket_id", "operator_pubkey", "operator_signature"]
+    for r in required:
+        if r not in payload:
+            return jsonify({"error": f"Missing field {r}"}), 400
+    message = f"REDEEM|{payload['ticket_id']}|{payload.get('timestamp', '')}"
+    if not verify_signature_hex(payload["operator_pubkey"], message, payload["operator_signature"]):
+        return jsonify({"error": "Invalid operator signature"}), 400
+    tx = bc.redeem_ticket_transaction(payload["ticket_id"], payload["operator_pubkey"], payload["operator_signature"])
+    return jsonify({"message": "Redeem queued (pending mining)", "tx": tx})
+
+@app.route("/ticket/<ticket_id>", methods=["GET"])
+def get_ticket(ticket_id):
+    state = bc.reconstruct_ticket_state(ticket_id)
+    if not state:
+        return jsonify({"error": "Ticket not found"}), 404
+    history = bc.find_ticket_history(ticket_id)
+    return jsonify({"ticket": state, "history": history})
+
+@app.route("/verify/<ticket_id>", methods=["GET"])
+def verify_ticket(ticket_id):
+    state = bc.reconstruct_ticket_state(ticket_id)
+    if not state:
+        return jsonify({"valid": False, "reason": "Ticket not found"}), 404
+    valid = state.get("status") != "redeemed"
+    return jsonify({"valid": valid, "state": state})
+
+# --- Simple CLI helpers for key management & demo operations ---
+
+def cli_genkeys(args):
+    keys = gen_keys()
+    print("Private key hex:\n", keys["private_key_hex"])
+    print("Public key hex:\n", keys["public_key_hex"])
+
+
+def cli_issue_demo(args):
+    # This helper issues a ticket locally without requiring HTTP call.
+    if not args.issuer_priv or not args.issuer_pub or not args.owner or not args.event:
+        print("Missing arguments. See --help")
+        return
+    ticket_id = str(uuid.uuid4())
+    timestamp = now_ts()
+    message = f"ISSUE|{args.event}|{args.owner}|{ticket_id}|{timestamp}"
+    signature = sign_message_hex(args.issuer_priv, message)
+    payload = {
+        "event": args.event,
+        "owner": args.owner,
+        "issuer_pubkey": args.issuer_pub,
+        "issuer_signature": signature,
+        "ticket_id": ticket_id,
+        "price": args.price,
+    }
+    # mimic API endpoint behavior
+    ticket = {
+        "ticket_id": payload["ticket_id"],
+        "event": payload["event"],
+        "owner": payload["owner"],
+        "price": payload.get("price"),
+        "issued_at": timestamp,
+        "issuer_pubkey": payload.get("issuer_pubkey"),
+        "status": "issued",
+    }
+    if not verify_signature_hex(payload["issuer_pubkey"], message, payload["issuer_signature"]):
+        print("Signature verification failed locally")
+        return
+    bc.create_ticket_transaction(ticket)
+    bc.save()
+    print("Issued ticket queued for mining. Ticket ID:", ticket_id)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Ticket Blockchain demo CLI")
+    sub = parser.add_subparsers(dest="cmd")
+
+    gk = sub.add_parser("genkeys", help="Generate ECDSA keypair")
+
+    issue = sub.add_parser("issue", help="Issue a ticket locally (no HTTP)")
+    issue.add_argument("--issuer-priv", required=False, help="Issuer private key hex")
+    issue.add_argument("--issuer-pub", required=False, help="Issuer public key hex")
+    issue.add_argument("--owner", required=False, help="Owner identifier (email)")
+    issue.add_argument("--event", required=False, help="Event name")
+    issue.add_argument("--price", type=float, default=None)
+
+    return parser.parse_args()
+
+# --- Entrypoint ---
+if __name__ == "__main__":
+    args = parse_args()
+    if args.cmd == "genkeys":
+        cli_genkeys(args)
+    elif args.cmd == "issue":
+        cli_issue_demo(args)
+    else:
+        # run Flask server
+        print(f"Starting Ticket Blockchain server on http://{SERVER_HOST}:{SERVER_PORT}")
+        app.run(host=SERVER_HOST, port=SERVER_PORT)
